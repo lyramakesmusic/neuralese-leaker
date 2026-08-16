@@ -7,6 +7,6 @@ kept my method/this app closed for a long time but it seems [several people](htt
 
 just run `uv run chat_stream_fable.py` or `python chat_stream_fable.py` and go to `localhost:5454`. deps are simple, you're smart, figure it out
 
-⚠️ note: fable seems to be broken rn - it previously worked fine, but this morning it's returning server errors. might be broken completely with this method. opus 5 works fine, gpt-5.6 works fine, o3 works fine.
+⚠️ fable gets content filtered on providers that aren't google vertex for some reason. provider hardcoded for fable in this repo so you shouldn't have to worry about it
 
 i take no responsibility for any of this, enjoy
