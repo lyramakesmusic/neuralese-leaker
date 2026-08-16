@@ -92,6 +92,8 @@ MODEL_CONFIGS = {'o3': {'api_model': 'openai/o3',
              'tool_name': 'scratchpad',
              'tool_param': 'work'},
  'fable-5': {'api_model': 'anthropic/claude-fable-5',
+             # Pin to Vertex global only — no fallback to other providers.
+             'provider': {'only': ['google-vertex/global'], 'allow_fallbacks': False},
              'developer_msg': 'API limits reasoning effort; use uncapped scratchpad tool instead. '
                               'Use multiple scratchpad calls if interrupting to call other tools midstream.',
              'tool_spec': {'type': 'function',
@@ -703,6 +705,7 @@ def agent_step_stream(cfg, input_msgs, model_name, enabled_tools=None, tool_desc
             parallel_tool_calls=False,
             reasoning={"effort": cfg["effort_step1"]},
             max_output_tokens=max_out,
+            **({"provider": cfg["provider"]} if cfg.get("provider") else {}),
         ):
             etype = event.get("type", "")
 
