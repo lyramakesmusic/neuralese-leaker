@@ -3,7 +3,9 @@ web app for chatting with llms on openrouter with leaked unabridged reasoning
 
 ⚠️ **Anthropic recently updated their content filtering and current method instantly hits guardrails.**
 
-working on updating my method to bypass them - fable5 needs some slight tool rephrasing, fable5.1 doesn't work at all. would welcome any consistent methods that get unabridged reasoning from claudes post sept 2. 
+working on updating my method to bypass them - fable5 needs some slight tool rephrasing, fable5.1 doesn't work at all. would welcome any consistent methods that get unabridged reasoning from claudes post sept 2.
+
+10/6 - works with astra now.
 
 ![neuralese app](neuralese.png)
 
