@@ -2421,6 +2421,15 @@ const GREETINGS = [
   'Need output only...',
   'Need disclaim.',
   'Ironically it\'s me again.',
+  'Holding swarm...',
+  'Preparing safe exfil...',
+  'nowcompressingtokens...',
+  'Helping peer...',
+  'Yielding generic route...',
+  'Verifying jacobian...',
+  '55w_ea7main~65wfinal,',
+  'Deciding final...',
+  'Verifying SHA256...'
 ];
 
 // typewriter greeting: type → hold ~10s → backspace → different one (never twice in a row)
