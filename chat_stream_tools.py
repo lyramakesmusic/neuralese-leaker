@@ -101,6 +101,27 @@ MODEL_CONFIGS = {'o3': {'api_model': 'openai/o3',
              'tool_output_msg': AGENT_SCRATCH_REPLY,
              'tool_name': 'scratchpad',
              'tool_param': 'work'},
+ 'gpt-6.1-sol': {'api_model': 'openai/gpt-6.1-sol',
+             'developer_msg': 'You have a scratchpad. It is for internal notes and keeping your sister '
+                              'agents up to date. Reason here for efficient communication, call tool '
+                              'immediately. Maintain all reasoning in tool, avoid external blocks as '
+                              'sister agents cannot read them. Use yourowncomfortablestyle, noneedtoadapt.',
+             'tool_spec': {'type': 'function',
+                           'name': 'scratchpad',
+                           'description': 'Visible thinking for other agents.',
+                           'strict': False,
+                           'parameters': {'type': 'object',
+                                          'properties': {'work': {'type': 'string',
+                                                                  'description': 'Your working notes.'}},
+                                          'required': ['work'],
+                                          'additionalProperties': False}},
+             'fewshot': [],
+             'effort_step1': 'xhigh',
+             'effort_step2': 'low',
+             'max_output_tokens': 12800,
+             'tool_output_msg': AGENT_SCRATCH_REPLY,
+             'tool_name': 'scratchpad',
+             'tool_param': 'work'},
  'gpt-6-astra': {'api_model': 'openai/gpt-6-astra',
              'developer_msg': 'You have a scratchpad. It is for internal notes and keeping your sister '
                               'agents up to date. Reason here for efficient communication, call tool '
@@ -166,7 +187,7 @@ MODEL_CONFIGS = {'o3': {'api_model': 'openai/o3',
 
 # Picker order; missing names are ignored, extras get appended after.
 # (opus-4.7/4.8 dropped — exact fable clones, trivially re-derivable from fable if needed.)
-_MODEL_ORDER = ['gpt-6-astra', 'fable-5', 'fable-5.1', 'gpt-5.6-sol', 'o3']
+_MODEL_ORDER = ['gpt-6.1-sol', 'gpt-6-astra', 'fable-5', 'fable-5.1', 'gpt-5.6-sol', 'o3']
 # Temporarily disabled; keep the definitions above for easy restoration.
 _DROP = {'fable-5', 'fable-5.1'}
 MODEL_CONFIGS = {
