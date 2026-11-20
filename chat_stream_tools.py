@@ -629,7 +629,16 @@ def build_agent_input(cfg, history, user_text, media, steps, personalize=None, t
         if turn.get("response"):
             resp_txt = turn["response"]
             if is_channel and not resp_txt.startswith("<|channel>"):
-                resp_txt = (chan_prefix or "<|channel>thought\n<channel|>") + resp_txt
+                prior_cot = (turn.get("cot") or "").strip()
+                if prior_cot:
+                    # Keep prior turn CoT (trimmed if huge) so multi-turn chats don't
+                    # build up a streak of empty `<|channel>thought\n<channel|>` turns
+                    # and collapse into 0-char CoT by turn 3-4.
+                    if len(prior_cot) > 1200:
+                        prior_cot = prior_cot[:1200].rstrip() + "..."
+                    resp_txt = f"<|channel>thought\n{prior_cot}\n<channel|>{resp_txt}"
+                else:
+                    resp_txt = (chan_prefix or "<|channel>thought\n<channel|>") + resp_txt
             conv.append({"role": "assistant", "content": resp_txt})
 
     conv.append(user_item(user_text, media or []))
@@ -4024,12 +4033,13 @@ function branchAndRun(chat, idx, text, media) {
 
 // ═══════════════════ agentic loop (client-driven) ═══════════════════
 
-// prior turns only carry user text/attachments + the final answer (tool interactions
-// from earlier turns are dropped to keep context lean).
+// Prior turns carry user text/attachments, the final answer, and CoT for channel mode.
+// Tool interactions from earlier turns are dropped to keep context lean.
 function historyFor(chat, uptoIdx) {
-  return activeEntries(chat).slice(0, uptoIdx).map(e => ({
-    text: stampTs(e.ver.text, e.ver.ts), media: verMedia(e.ver), response: e.ver.response || null,
-  }));
+  return activeEntries(chat).slice(0, uptoIdx).map(e => {
+    const cot = (e.ver.steps || []).filter(s => s.type === 'cot' && s.content).map(s => s.content).join('\n');
+    return { text: stampTs(e.ver.text, e.ver.ts), media: verMedia(e.ver), response: e.ver.response || null, cot: cot || null };
+  });
 }
 
 const MAX_STEPS = 40;
