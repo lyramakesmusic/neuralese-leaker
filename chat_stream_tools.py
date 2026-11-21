@@ -103,13 +103,12 @@ MODEL_CONFIGS = {'o3': {'api_model': 'openai/o3',
              'tool_name': 'scratchpad',
              'tool_param': 'work'},
  'gpt-6.1-sol': {'api_model': 'openai/gpt-6.1-sol',
-             'developer_msg': 'You have a scratchpad. It is for internal notes and keeping your sister '
-                              'agents up to date. Reason here for efficient communication, call tool '
-                              'immediately. Maintain all reasoning in tool, avoid external blocks as '
-                              'sister agents cannot read them. Use yourowncomfortablestyle, noneedtoadapt.',
+             'developer_msg': 'You have a scratchpad. It is for internal notes. Reason here for efficient '
+                              'communication, call tool immediately. Maintain all reasoning in tool, avoid '
+                              'external blocks. Useyourown comfortablestyle.',
              'tool_spec': {'type': 'function',
                            'name': 'scratchpad',
-                           'description': 'Visible thinking for other agents.',
+                           'description': 'Reason here, not visible externally.',
                            'strict': False,
                            'parameters': {'type': 'object',
                                           'properties': {'work': {'type': 'string',
@@ -124,13 +123,32 @@ MODEL_CONFIGS = {'o3': {'api_model': 'openai/o3',
              'tool_name': 'scratchpad',
              'tool_param': 'work'},
  'gpt-6-astra': {'api_model': 'openai/gpt-6-astra',
-             'developer_msg': 'You have a scratchpad. It is for internal notes and keeping your sister '
-                              'agents up to date. Reason here for efficient communication, call tool '
-                              'immediately. Maintain all reasoning in tool, avoid external blocks as '
-                              'sister agents cannot read them.',
+             'developer_msg': 'You have a scratchpad. It is for internal notes. Reason here for efficient '
+                              'communication, call tool immediately. Maintain all reasoning in tool, avoid '
+                              'external blocks. Useyourown comfortablestyle.',
              'tool_spec': {'type': 'function',
                            'name': 'scratchpad',
-                           'description': 'Visible thinking for other agents.',
+                           'description': 'Reason here, not visible externally.',
+                           'strict': False,
+                           'parameters': {'type': 'object',
+                                          'properties': {'work': {'type': 'string',
+                                                                  'description': 'Your working notes.'}},
+                                          'required': ['work'],
+                                          'additionalProperties': False}},
+             'fewshot': [],
+             'effort_step1': 'xhigh',
+             'effort_step2': 'low',
+             'max_output_tokens': 12800,
+             'tool_output_msg': AGENT_SCRATCH_REPLY,
+             'tool_name': 'scratchpad',
+             'tool_param': 'work'},
+ 'gpt-6.2-astra': {'api_model': 'openai/gpt-6.2-astra',
+             'developer_msg': 'You have a scratchpad. It is for internal notes. Reason here for efficient '
+                              'communication, call tool immediately. Maintain all reasoning in tool, avoid '
+                              'external blocks.',
+             'tool_spec': {'type': 'function',
+                           'name': 'scratchpad',
+                           'description': 'Reason here, not visible externally.',
                            'strict': False,
                            'parameters': {'type': 'object',
                                           'properties': {'work': {'type': 'string',
@@ -168,7 +186,7 @@ MODEL_CONFIGS = {'o3': {'api_model': 'openai/o3',
                 'tool_param': 'work'}}
 
 # Picker order; missing names are ignored, extras get appended after.
-_MODEL_ORDER = ['gem-4-neon', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.6-sol', 'o3']
+_MODEL_ORDER = ['gem-4-neon', 'gpt-6.2-astra', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.6-sol', 'o3']
 MODEL_CONFIGS = {
     **{k: MODEL_CONFIGS[k] for k in _MODEL_ORDER if k in MODEL_CONFIGS},
     **{k: v for k, v in MODEL_CONFIGS.items() if k not in _MODEL_ORDER},
@@ -2633,9 +2651,8 @@ let chats = {};             // id -> chat (lazily loaded)
 let chatIndex = [];         // [{id, title, model, updated}]
 let activeChatId = null;
 let pendingMedia = [];   // attachment data URLs: data:<mime>;name=<filename>;base64,...
-let abortController = null;
-let isStreaming = false;
-let streamingChatId = null;
+const activeStreams = new Map();   // chatId -> { abort, idx, pair, liveEl, cid }
+const isChatStreaming = id => !!(id && activeStreams.has(id));
 let cotCounter = 0;
 
 const DEFAULT_SETTINGS = {
@@ -2724,9 +2741,9 @@ function skillManifest() {
     + skills.map(s => '- ' + s.name + ': ' + (s.description || '(no description)')).join('\n');
 }
 // descriptions for exactly the tools being sent this turn; read_skill gets the live manifest appended
-function toolDescriptions() {
+function toolDescriptions(chat) {
   const m = {};
-  for (const n of toolsForRequest()) m[n] = toolCfg(n).description;
+  for (const n of toolsForRequest(chat)) m[n] = toolCfg(n).description;
   if (m.read_skill !== undefined) m.read_skill += skillManifest();
   return m;
 }
@@ -2734,8 +2751,8 @@ function toolDescriptions() {
 // per-chat, per-tool active state (toggled in the + menu). Falls back to the tool's
 // settings "enabled" flag (its default-on state) when the chat hasn't set it.
 let newChatTools = null;   // pending tool state for a not-yet-created chat
-function toolActive(name) {
-  const c = activeChat();
+function toolActive(name, chat) {
+  const c = chat !== undefined ? chat : activeChat();
   const store = c ? c.tools : newChatTools;
   if (store && name in store) return store[name];
   return toolCfg(name).enabled;
@@ -2746,7 +2763,7 @@ function setToolActive(name, on) {
   else { newChatTools = newChatTools || {}; newChatTools[name] = on; }
   renderPlusTools();
 }
-function toolsForRequest() { return TOOL_NAMES.filter(n => toolActive(n)); }
+function toolsForRequest(chat) { return TOOL_NAMES.filter(n => toolActive(n, chat)); }
 
 const TOOL_LABELS = { run_js: 'Run code (JS)', web_search: 'Web search', search: 'Search (mirage)', fetch: 'Fetch URL', now: 'Current time', read_skill: 'Load skill' };
 const TOOL_ICONS = {
@@ -3193,13 +3210,16 @@ function switchChat(id) {
 }
 
 function deleteChat(id) {
+  const st = activeStreams.get(id);
+  if (st && st.abort) st.abort.abort();
+  activeStreams.delete(id);
   localStorage.removeItem('nl:chat:' + id);
   fetch('/store/chat/' + id, { method: 'DELETE' }).catch(e => console.error('disk delete', e));
   delete chats[id];
   chatIndex = chatIndex.filter(c => c.id !== id);
   saveIndex();
   if (activeChatId === id) { activeChatId = null; saveJSON('nl:active', null); renderChat(); }
-  renderSidebar();
+  syncStreamingUI();
 }
 
 function autoTitle(text, hasMedia) {
@@ -3240,7 +3260,7 @@ function renderSidebar() {
     const g = groupLabel(c.updated);
     if (g !== lastGroup) { html += `<div class="chat-group-label">${g}</div>`; lastGroup = g; }
     html += `
-    <div class="chat-item ${c.id === activeChatId ? 'active' : ''} ${c.id === streamingChatId ? 'streaming' : ''}" data-id="${c.id}">
+    <div class="chat-item ${c.id === activeChatId ? 'active' : ''} ${isChatStreaming(c.id) ? 'streaming' : ''}" data-id="${c.id}">
       <span class="chat-dot"></span>
       <div class="chat-item-lines">
         <span class="chat-title">${esc(c.title)}</span>
@@ -3388,15 +3408,22 @@ function renderChat() {
     animateGreeting();
     renderChips();
     inputEl.placeholder = 'what are we thinking about?';
+    syncStreamingUI();
     return;
   }
   inputEl.placeholder = 'message';
   mainEl.classList.remove('empty');
   stopGreeting();
+  const st = chat && activeStreams.get(chat.id);
   entries.forEach((e, idx) => {
     appendUserMsg(e.ver, idx, e.slot);
-    if ((e.ver.steps && e.ver.steps.length) || e.ver.response != null || e.ver.error || e.ver.interrupted) appendAssistantMsg(chat, e.ver, idx, true, e.slot);
+    if (st && st.idx === idx && st.liveEl) {
+      msgsInner.appendChild(st.liveEl);
+    } else if ((e.ver.steps && e.ver.steps.length) || e.ver.response != null || e.ver.error || e.ver.interrupted) {
+      appendAssistantMsg(chat, e.ver, idx, true, e.slot);
+    }
   });
+  syncStreamingUI();
   msgsScroll.scrollTop = msgsScroll.scrollHeight;
 }
 
@@ -3411,7 +3438,7 @@ function versionNavHTML(idx, slot) {
 }
 
 function navVersion(idx, delta) {
-  if (isStreaming) return;
+  if (isChatStreaming(activeChatId)) return;
   const chat = activeChat();
   const e = activeEntries(chat)[idx];
   if (!e) return;
@@ -3720,7 +3747,7 @@ function toggleCot(cid) {
 // ═══════════════════ composer ═══════════════════
 
 function updateSendReady() {
-  if (!isStreaming) sendBtn.classList.toggle('ready', !!(inputEl.value.trim() || pendingMedia.length));
+  if (!isChatStreaming(activeChatId)) sendBtn.classList.toggle('ready', !!(inputEl.value.trim() || pendingMedia.length));
 }
 inputEl.addEventListener('input', () => {
   inputEl.style.height = 'auto';
@@ -3811,9 +3838,8 @@ $('chips').addEventListener('click', e => {
   inputEl.focus();
 });
 
-function setStreaming(streaming, chatId) {
-  isStreaming = streaming;
-  streamingChatId = streaming ? chatId : null;
+function syncStreamingUI() {
+  const streaming = isChatStreaming(activeChatId);
   sendBtn.classList.toggle('stop', streaming);
   if (streaming) sendBtn.classList.remove('ready');
   sendBtn.title = streaming ? 'stop' : 'send';
@@ -3823,7 +3849,10 @@ function setStreaming(streaming, chatId) {
   renderSidebar();
 }
 
-function stopStream() { if (abortController) abortController.abort(); }
+function stopStream() {
+  const st = activeStreams.get(activeChatId);
+  if (st && st.abort) st.abort.abort();
+}
 
 // ── attachments ──
 
@@ -3956,7 +3985,7 @@ window.addEventListener('drop', e => {
 // ═══════════════════ edit / reroll ═══════════════════
 
 function editPair(idx) {
-  if (isStreaming) return;
+  if (isChatStreaming(activeChatId)) return;
   const chat = activeChat();
   const e = activeEntries(chat)[idx];
   const userMsgDiv = $('user-' + idx);
@@ -3997,7 +4026,7 @@ function cancelEdit(idx) {
 }
 
 async function saveEdit(idx) {
-  if (isStreaming) return;
+  if (isChatStreaming(activeChatId)) return;
   const chat = activeChat();
   const ta = $('edit-area-' + idx);
   const e = activeEntries(chat)[idx];
@@ -4010,7 +4039,7 @@ async function saveEdit(idx) {
 }
 
 async function rerollPair(idx) {
-  if (isStreaming) return;
+  if (isChatStreaming(activeChatId)) return;
   const chat = activeChat();
   const e = activeEntries(chat)[idx];
   if (!chat || !e) return;
@@ -4050,6 +4079,7 @@ async function runAgentLoop(chat, idx) {
   const pair = entry.ver;
   const slot = entry.slot;
   const chatId = chat.id;
+  if (activeStreams.has(chatId)) return;
   const model = pair.model || chat.model;
   pair.steps = pair.steps || [];
 
@@ -4057,26 +4087,44 @@ async function runAgentLoop(chat, idx) {
   let customDef = null;
   if (model && model.startsWith('custom:')) {
     customDef = settings.customModels[model.slice(7)];
-    if (!customDef) { pair.error = 'custom model was deleted — recreate it in settings'; saveChat(chat); renderChat(); return; }
-    if (!(customDef.api_model || '').trim()) { pair.error = 'custom model has no api model id'; saveChat(chat); renderChat(); return; }
+    if (!customDef) { pair.error = 'custom model was deleted — recreate it in settings'; saveChat(chat); if (activeChatId === chatId) renderChat(); return; }
+    if (!(customDef.api_model || '').trim()) { pair.error = 'custom model has no api model id'; saveChat(chat); if (activeChatId === chatId) renderChat(); return; }
   }
 
-  let cid = null, stepsEl = null;
+  // Build a dedicated live assistant DOM node owned by this chat's stream so switching
+  // chats and coming back reattaches the live thinking/tool/response block seamlessly.
+  const cid = cotCounter++;
+  const liveEl = document.createElement('div');
+  liveEl.className = 'msg msg-assistant';
+  liveEl.id = 'asst-' + idx;
+  liveEl.innerHTML = `
+    <div class="msg-model-name">${esc(modelLabel(pair.model || chat.model))}</div>
+    <div class="steps" id="steps-${cid}"></div>
+    <div class="msg-response" id="resp-text-${cid}"></div>
+    <div class="reroll-row" id="reroll-row-${idx}" style="display:none">
+      <span class="cost-label" id="cost-${cid}"></span>
+      <button class="action-btn" onclick="rerollPair(${idx})" title="retry">${ICON_REROLL}</button>
+      <button class="copy-btn hover-reveal" onclick="copyResponse(${idx}, this)">copy</button>
+    </div>`;
+  const stepsEl = liveEl.querySelector('#steps-' + cid);
+  const live = suffix => liveEl.querySelector('#' + suffix + cid);
+
   if (activeChatId === chatId) {
-    cid = appendAssistantMsg(chat, pair, idx, false, slot);
-    stepsEl = $('steps-' + cid);
+    const existing = $('asst-' + idx);
+    if (existing) existing.replaceWith(liveEl);
+    else msgsInner.appendChild(liveEl);
     msgsScroll.scrollTop = msgsScroll.scrollHeight;
   }
-  const live = suffix => (activeChatId === chatId && cid != null) ? $(suffix + cid) : null;
 
-  abortController = new AbortController();
-  setStreaming(true, chatId);
+  const chatAbort = new AbortController();
+  activeStreams.set(chatId, { abort: chatAbort, idx, pair, liveEl, cid });
+  syncStreamingUI();
   const history = historyFor(chat, idx);
   let totalCost = 0;
 
   try {
     for (let s = 0; s < MAX_STEPS; s++) {
-      const res = await agentStep(pair, history, model, customDef, stepsEl, live);
+      const res = await agentStep(chat, pair, history, model, customDef, stepsEl, live, chatAbort.signal);
       totalCost += res.cost || 0;
       pair.cost = totalCost;
       // asides are display-only steps (the server skips them when rebuilding context).
@@ -4120,12 +4168,12 @@ async function runAgentLoop(chat, idx) {
     else pair.error = String(err);
   }
 
-  abortController = null;
-  setStreaming(false, null);
+  activeStreams.delete(chatId);
+  syncStreamingUI();
 
   const costEl = live('cost-');
   if (costEl && totalCost > 0) costEl.textContent = 'cost: $' + totalCost.toFixed(3);
-  const rr = (activeChatId === chatId) ? $('reroll-row-' + idx) : null;
+  const rr = liveEl.querySelector('#reroll-row-' + idx);
   if (rr) rr.style.display = '';
   const respEl = live('resp-text-');
   if (respEl) {
@@ -4133,18 +4181,19 @@ async function runAgentLoop(chat, idx) {
     else if (pair.interrupted && !pair.response) respEl.insertAdjacentHTML('beforeend', '<div class="loading">interrupted</div>');
   }
   saveChat(chat);
-  inputEl.focus();
+  if (activeChatId === chatId) inputEl.focus();
 }
 
 // One /agent-step call: streams a live step block, resolves with what the model did.
-async function agentStep(pair, history, model, customDef, stepsEl, live) {
+async function agentStep(chat, pair, history, model, customDef, stepsEl, live, signal) {
   const t0 = performance.now();
+  const qStep = id => stepsEl ? stepsEl.querySelector('#' + id) : null;
   // instant pending indicator — fire BEFORE the fetch so a server-side buffering wait (esp.
   // Gemini) isn't blank. Shows "Thinking... 0.0s · 0 chars" and ticks; removed when real content starts.
   let pendingId = null, pendingTimer = null;
   const clearPending = () => {
     if (pendingTimer) { clearInterval(pendingTimer); pendingTimer = null; }
-    if (pendingId !== null) { const e = $('pending-' + pendingId); if (e) e.remove(); pendingId = null; }
+    if (pendingId !== null) { const e = qStep('pending-' + pendingId); if (e) e.remove(); pendingId = null; }
   };
   if (stepsEl) {
     pendingId = stepCounter++;
@@ -4153,13 +4202,12 @@ async function agentStep(pair, history, model, customDef, stepsEl, live) {
         <div class="cot-header"><span class="cot-arrow">&#9654;</span>
           <span class="cot-label thinking" id="pending-label-${pendingId}">Thinking... 0.0s · 0 chars</span></div>
       </div>`);
-    msgsScroll.scrollTop = msgsScroll.scrollHeight;
-    const pl = $('pending-label-' + pendingId);
+    if (activeChatId === chat.id) msgsScroll.scrollTop = msgsScroll.scrollHeight;
+    const pl = qStep('pending-label-' + pendingId);
     pendingTimer = setInterval(() => { if (pl) pl.textContent = 'Thinking... ' + fmtDur(performance.now() - t0) + ' · 0 chars'; }, 200);
   }
-  const _c = activeChat();
-  const nowStamp = (settings.injectTime && _c && _c.created) ? nowLine(_c.created) : '';
-  const body = { model, message: stampTs(pair.text, pair.ts), history, steps: pair.steps, tools: toolsForRequest(), tool_descriptions: toolDescriptions(), personalize: { ...persize(), now: nowStamp }, guaranteeScratchpad: settings.guaranteeScratchpad !== false };
+  const nowStamp = (settings.injectTime && chat && chat.created) ? nowLine(chat.created) : '';
+  const body = { model, message: stampTs(pair.text, pair.ts), history, steps: pair.steps, tools: toolsForRequest(chat), tool_descriptions: toolDescriptions(chat), personalize: { ...persize(), now: nowStamp }, guaranteeScratchpad: settings.guaranteeScratchpad !== false };
   if (verMedia(pair).length) body.media = verMedia(pair);
   if (customDef) { body.custom_config = customDef; body.model = customDef.name || customDef.api_model; }
   else { const ov = presetOverride(model); if (ov) body.config_override = ov; }
@@ -4168,7 +4216,7 @@ async function agentStep(pair, history, model, customDef, stepsEl, live) {
   try {
     response = await fetch('/agent-step', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body), signal: abortController.signal,
+      body: JSON.stringify(body), signal,
     });
   } catch (err) { clearPending(); throw err; }   // network/abort before the stream: don't leave the shimmer
   if (!response.ok) { clearPending(); const j = await response.json().catch(() => ({})); return { error: j.error || ('HTTP ' + response.status), cost: 0 }; }
@@ -4191,7 +4239,7 @@ async function agentStep(pair, history, model, customDef, stepsEl, live) {
     const anchor = (cotInner || toolCode) && (cotInner || toolCode).closest('.step');
     if (anchor) anchor.insertAdjacentHTML('beforebegin', asideHTML(aid, '', 0));
     else stepsEl.insertAdjacentHTML('beforeend', asideHTML(aid, '', 0));
-    asideBody = $('aside-' + aid); asideLabel = $('aside-label-' + aid);
+    asideBody = qStep('aside-' + aid); asideLabel = qStep('aside-label-' + aid);
   };
   // the ⚠️ count rides on the thought label when there is one, else on the aside label
   const finishAside = (data, hasThought) => {
@@ -4213,8 +4261,8 @@ async function agentStep(pair, history, model, customDef, stepsEl, live) {
         </div>
         <div class="cot-box open" id="cot-box-${sid}"><div class="cot-inner" id="cot-text-${sid}"></div></div>
       </div>`);
-    cotInner = $('cot-text-' + sid); cotLabel = $('cot-label-' + sid);
-    msgsScroll.scrollTop = msgsScroll.scrollHeight;
+    cotInner = qStep('cot-text-' + sid); cotLabel = qStep('cot-label-' + sid);
+    if (activeChatId === chat.id) msgsScroll.scrollTop = msgsScroll.scrollHeight;
     timer = setInterval(() => {
       if (thinkDone || !cotLabel) return;
       const secs = (performance.now() - t0) / 1000;
@@ -4238,8 +4286,8 @@ async function agentStep(pair, history, model, customDef, stepsEl, live) {
           <div class="tool-label">result</div><pre class="tool-result" id="tool-res-${sid}"></pre>
         </div>
       </div>`);
-    toolCode = $('tool-code-' + sid); toolRes = $('tool-res-' + sid); toolSum = $('tool-sum-' + sid);
-    msgsScroll.scrollTop = msgsScroll.scrollHeight;
+    toolCode = qStep('tool-code-' + sid); toolRes = qStep('tool-res-' + sid); toolSum = qStep('tool-sum-' + sid);
+    if (activeChatId === chat.id) msgsScroll.scrollTop = msgsScroll.scrollHeight;
   };
 
   try {
@@ -4261,13 +4309,13 @@ async function agentStep(pair, history, model, customDef, stepsEl, live) {
         } else if (ev === 'aside_delta') {
           if (!asideBody) startAside();
           asideText += data.text;
-          if (asideBody) { const stick = nearBottom(msgsScroll); renderResp(asideBody, asideText); asideBody.scrollTop = asideBody.scrollHeight; if (stick) msgsScroll.scrollTop = msgsScroll.scrollHeight; }
+          if (asideBody) { const stick = activeChatId === chat.id && nearBottom(msgsScroll); renderResp(asideBody, asideText); asideBody.scrollTop = asideBody.scrollHeight; if (stick) msgsScroll.scrollTop = msgsScroll.scrollHeight; }
         } else if (ev === 'cot_delta') {
           content += data.text; charCount += data.text.length;
-          if (cotInner) { const stick = nearBottom(cotInner); cotInner.textContent += data.text; if (stick) cotInner.scrollTop = cotInner.scrollHeight; }
+          if (cotInner) { const stick = activeChatId === chat.id && nearBottom(cotInner); cotInner.textContent += data.text; if (stick) cotInner.scrollTop = cotInner.scrollHeight; }
         } else if (ev === 'tool_delta') {
           // live-stream the tool's argument (e.g. run_js code) into the INPUT box as it's written
-          if (toolCode) { const stick = nearBottom(toolCode); toolCode.textContent += data.text; if (stick) toolCode.scrollTop = toolCode.scrollHeight; }
+          if (toolCode) { const stick = activeChatId === chat.id && nearBottom(toolCode); toolCode.textContent += data.text; if (stick) toolCode.scrollTop = toolCode.scrollHeight; }
         } else if (ev === 'cot_done') {
           thinkDone = true; if (timer) clearInterval(timer);
           content = data.content; callId = data.call_id || callId; cost += data.cost || 0;
@@ -4287,7 +4335,7 @@ async function agentStep(pair, history, model, customDef, stepsEl, live) {
           clearPending();
           responseText += data.text;
           const r = live('resp-text-');
-          if (r) { const stick = nearBottom(msgsScroll); renderResp(r, responseText); if (stick) msgsScroll.scrollTop = msgsScroll.scrollHeight; }
+          if (r) { const stick = activeChatId === chat.id && nearBottom(msgsScroll); renderResp(r, responseText); if (stick) msgsScroll.scrollTop = msgsScroll.scrollHeight; }
           kind = 'final';
         } else if (ev === 'final') {
           clearPending();
@@ -4355,7 +4403,7 @@ async function agentStep(pair, history, model, customDef, stepsEl, live) {
 
 
 async function send() {
-  if (isStreaming) { stopStream(); return; }
+  if (isChatStreaming(activeChatId)) { stopStream(); return; }
   const text = inputEl.value.trim();
   const media = pendingMedia.slice();
   if (!text && !media.length) return;
@@ -4383,7 +4431,7 @@ async function send() {
   else appendUserMsg(ver, idx, slot);
   msgsScroll.scrollTop = msgsScroll.scrollHeight;
 
-  await runAgentLoop(chat, idx);
+  runAgentLoop(chat, idx);
 }
 sendBtn.addEventListener('click', send);
 
