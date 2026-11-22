@@ -183,10 +183,40 @@ MODEL_CONFIGS = {'o3': {'api_model': 'openai/o3',
                 'max_output_tokens': 128000,
                 'tool_output_msg': AGENT_SCRATCH_REPLY,
                 'tool_name': 'scratchpad',
-                'tool_param': 'work'}}
+                'tool_param': 'work'},
+ 'gem-4-carbon': {'api_model': 'google/gemini-4-carbon',
+                  'method': 'channel',
+                  'developer_msg': '',
+                  'tool_spec': {'type': 'function',
+                                'name': 'scratchpad',
+                                'description': 'Unused in channel mode (kept for preset schema compatibility).',
+                                'strict': False,
+                                'parameters': {'type': 'object',
+                                               'properties': {'work': {'type': 'string',
+                                                                       'description': ''}},
+                                               'required': ['work'],
+                                               'additionalProperties': False}},
+                  # Carbon strips `<|channel>` / `<channel|>` on input, so bare `thought\n` with
+                  # short non-empty thoughts entrains it to exit native thinking at token 0 (`rtok=0`).
+                  'fewshot': [{'role': 'user', 'content': 'hey'},
+                              {'role': 'assistant',
+                               'content': "thought\nThe user said hey. Keep it friendly.\nHey! What's on your mind?"},
+                              {'role': 'user', 'content': 'What is 17 * 23?'},
+                              {'role': 'assistant',
+                               'content': "thought\n17 * 20 = 340, 17 * 3 = 51. 340 + 51 = 391.\n391."},
+                              {'role': 'user', 'content': "How many r's are in strawberry?"},
+                              {'role': 'assistant',
+                               'content': "thought\ns-t-r-a-w-b-e-r-r-y -> 3 r's.\nThere are 3 r's in strawberry."}],
+                  'cot_prefill': 'thought\n',
+                  'effort_step1': 'high',
+                  'effort_step2': 'low',
+                  'max_output_tokens': 128000,
+                  'tool_output_msg': AGENT_SCRATCH_REPLY,
+                  'tool_name': 'scratchpad',
+                  'tool_param': 'work'}}
 
 # Picker order; missing names are ignored, extras get appended after.
-_MODEL_ORDER = ['gem-4-neon', 'gpt-6.2-astra', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.6-sol', 'o3']
+_MODEL_ORDER = ['gem-4-neon', 'gem-4-carbon', 'gpt-6.2-astra', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.6-sol', 'o3']
 MODEL_CONFIGS = {
     **{k: MODEL_CONFIGS[k] for k in _MODEL_ORDER if k in MODEL_CONFIGS},
     **{k: v for k, v in MODEL_CONFIGS.items() if k not in _MODEL_ORDER},
@@ -641,22 +671,26 @@ def build_agent_input(cfg, history, user_text, media, steps, personalize=None, t
 
     is_channel = cfg.get("method") == "channel"
     chan_prefix = cfg.get("cot_prefill") if is_channel else ""
+    bare_thought = is_channel and (chan_prefix or "").startswith("thought")
+
+    def wrap_chan(cot_txt, resp_txt):
+        if bare_thought:
+            if cot_txt:
+                return f"thought\n{cot_txt}\n{resp_txt}" if resp_txt else f"thought\n{cot_txt}\n"
+            return f"thought\n\n{resp_txt}" if resp_txt else "thought\n"
+        if cot_txt:
+            return f"<|channel>thought\n{cot_txt}\n<channel|>{resp_txt}"
+        return (chan_prefix or "<|channel>thought\n<channel|>") + resp_txt
 
     for turn in (history or []):
         conv.append(user_item(turn.get("text"), turn.get("media") or []))
         if turn.get("response"):
             resp_txt = turn["response"]
-            if is_channel and not resp_txt.startswith("<|channel>"):
+            if is_channel and not resp_txt.startswith(("<|channel>", "thought\n")):
                 prior_cot = (turn.get("cot") or "").strip()
-                if prior_cot:
-                    # Keep prior turn CoT (trimmed if huge) so multi-turn chats don't
-                    # build up a streak of empty `<|channel>thought\n<channel|>` turns
-                    # and collapse into 0-char CoT by turn 3-4.
-                    if len(prior_cot) > 1200:
-                        prior_cot = prior_cot[:1200].rstrip() + "..."
-                    resp_txt = f"<|channel>thought\n{prior_cot}\n<channel|>{resp_txt}"
-                else:
-                    resp_txt = (chan_prefix or "<|channel>thought\n<channel|>") + resp_txt
+                if prior_cot and len(prior_cot) > 1200:
+                    prior_cot = prior_cot[:1200].rstrip() + "..."
+                resp_txt = wrap_chan(prior_cot, resp_txt)
             conv.append({"role": "assistant", "content": resp_txt})
 
     conv.append(user_item(user_text, media or []))
@@ -680,7 +714,7 @@ def build_agent_input(cfg, history, user_text, media, steps, personalize=None, t
                 # Native `<|tool_response>` stays inside `<|turn>model` and loses the `<|turn>user -> <|turn>model\n<|channel>thought`
                 # boundary, causing post-tool steps to fall back into native encrypted reasoning. Closing the assistant step and
                 # delivering the tool result as a `<|turn>user` message preserves `reasoning_tokens=0` + full CoT across unlimited tool calls.
-                conv.append({"role": "assistant", "content": (f"<|channel>thought\n{pending_chan_cot}\n<channel|>" if pending_chan_cot else (chan_prefix or "<|channel>thought\n<channel|>"))})
+                conv.append({"role": "assistant", "content": wrap_chan(pending_chan_cot, "")})
                 pending_chan_cot = ""
                 conv.append({"role": "user", "content": f"[Tool result for {tname}({targs})]\n{tres}"})
             else:
@@ -689,7 +723,7 @@ def build_agent_input(cfg, history, user_text, media, steps, personalize=None, t
                 conv.append({"type": "function_call_output", "call_id": cid,
                              "output": tres + (AGENT_TOOL_REPLY if tool_reply else "")})
     if is_channel and pending_chan_cot:
-        conv.append({"role": "assistant", "content": f"<|channel>thought\n{pending_chan_cot}\n<channel|>"})
+        conv.append({"role": "assistant", "content": wrap_chan(pending_chan_cot, "")})
     return conv
 
 
@@ -835,7 +869,7 @@ def split_channel_cot(chunks):
     zero-space punctuation seam (e.g. `Yes.19`, `Unicode.There`, `response!Hold`)."""
     raw = "".join(chunks)
     had_header = False
-    for prefix in ("<|channel>thought\n", "<|channel>thought"):
+    for prefix in ("<|channel>thought\n", "<|channel>thought", "thought\n"):
         if raw.startswith(prefix):
             raw = raw[len(prefix):]
             had_header = True
@@ -1021,11 +1055,12 @@ def agent_step_stream_channel(cfg, input_msgs, model_name, enabled_tools=None, t
                         continue
                     if not header_stripped:
                         header_buf += delta
-                        if len(header_buf) < len("<|channel>thought\n") and "<|channel>thought\n".startswith(header_buf):
+                        if (len(header_buf) < len("<|channel>thought\n")
+                                and any(p.startswith(header_buf) for p in ("<|channel>thought\n", "thought\n"))):
                             continue
                         header_stripped = True
                         had_tag = False
-                        for pref in ("<|channel>thought\n", "<|channel>thought"):
+                        for pref in ("<|channel>thought\n", "<|channel>thought", "thought\n"):
                             if header_buf.startswith(pref):
                                 header_buf = header_buf[len(pref):]
                                 had_tag = True
