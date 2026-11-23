@@ -1238,13 +1238,20 @@ def agent_step_stream(cfg, input_msgs, model_name, enabled_tools=None, tool_desc
             cot_parts.append(parse_tool_arg("".join(arg_chunks), tool_param))
 
     # Gemini hides all other tools from the model when `tool_choice` pins a single function name,
-    # causing it to believe `run_js`/`web_search` don't exist. Using `"required"` keeps every
-    # enabled tool visible while still forcing an immediate tool call (scratchpad first).
+    # causing it to think `run_js`/`web_search` don't exist on Step 1 — while using `"required"`
+    # lets it skip `scratchpad` and jump straight to `run_js` with hidden reasoning. Fix: keep
+    # `tool_choice` pinned to `scratchpad`, and tell Gemini in the developer message which real
+    # tools are available on its next step.
     is_gemini = "gemini" in (cfg.get("api_model") or "").lower()
-    if force_cot:
-        tc = "required" if (is_gemini and len(tools) > 1) else {"type": "function", "name": tool_name}
-    else:
-        tc = "auto"
+    if is_gemini and force_cot and len(tools) > 1:
+        other_names = ", ".join(t["name"] for t in tools[1:])
+        input_msgs = copy.deepcopy(input_msgs)
+        note = f"\nOther tools ({other_names}) are available on your next step after calling {tool_name}."
+        if input_msgs and input_msgs[0].get("role") == "developer":
+            input_msgs[0]["content"] = (input_msgs[0].get("content") or "") + note
+        else:
+            input_msgs.insert(0, {"role": "developer", "content": note.strip()})
+    tc = {"type": "function", "name": tool_name} if force_cot else "auto"
 
     stream = None
     try:
