@@ -163,21 +163,20 @@ MODEL_CONFIGS = {'o3': {'api_model': 'openai/o3',
              'tool_name': 'scratchpad',
              'tool_param': 'work'},
  'gem-4-neon': {'api_model': 'google/gemini-4-neon',
-                'method': 'channel',
-                'developer_msg': '',
+                'method': 'scratchpad',
+                'developer_msg': 'You have a scratchpad. It is for internal notes. Reason here for efficient '
+                                 'communication, call tool immediately. Maintain all reasoning in tool, avoid '
+                                 'external blocks.',
                 'tool_spec': {'type': 'function',
                               'name': 'scratchpad',
-                              'description': 'Unused in channel mode (kept for preset schema compatibility).',
+                              'description': 'Reason here, not visible externally.',
                               'strict': False,
                               'parameters': {'type': 'object',
                                              'properties': {'work': {'type': 'string',
-                                                                     'description': ''}},
+                                                                     'description': 'Your working notes.'}},
                                              'required': ['work'],
                                              'additionalProperties': False}},
-                'fewshot': [{'role': 'user', 'content': 'hey'},
-                            {'role': 'assistant',
-                             'content': "<|channel>thought\n<channel|>Hey! What's on your mind?"}],
-                'cot_prefill': '<|channel>thought\n<channel|>',
+                'fewshot': [],
                 'effort_step1': 'high',
                 'effort_step2': 'low',
                 'max_output_tokens': 128000,
@@ -1238,12 +1237,21 @@ def agent_step_stream(cfg, input_msgs, model_name, enabled_tools=None, tool_desc
         if cur_tool == tool_name and arg_chunks:
             cot_parts.append(parse_tool_arg("".join(arg_chunks), tool_param))
 
+    # Gemini hides all other tools from the model when `tool_choice` pins a single function name,
+    # causing it to believe `run_js`/`web_search` don't exist. Using `"required"` keeps every
+    # enabled tool visible while still forcing an immediate tool call (scratchpad first).
+    is_gemini = "gemini" in (cfg.get("api_model") or "").lower()
+    if force_cot:
+        tc = "required" if (is_gemini and len(tools) > 1) else {"type": "function", "name": tool_name}
+    else:
+        tc = "auto"
+
     stream = None
     try:
         stream = api_stream_openrouter(
             cfg["api_model"], input_msgs,
             tools=tools,
-            tool_choice=({"type": "function", "name": tool_name} if force_cot else "auto"),
+            tool_choice=tc,
             parallel_tool_calls=False,
             reasoning={"effort": cfg["effort_step1"]},
             max_output_tokens=max_out,
@@ -2850,12 +2858,12 @@ function saveJSON(key, val) {
   return true;
 }
 
-// ── disk mirror (data/ next to the server) ──
-// every chat / settings / index / usage write is mirrored to disk. one request in
-// flight per path; writes that land meanwhile coalesce into the latest value.
+// ── storage ──
+// Chats live on disk (`data/chats/<id>.json`) + in-memory `chats[id]`; never in localStorage
+// (big audio/image chats blow the ~5MB browser quota and would otherwise fail/wipe storage).
+// localStorage holds ONLY small settings/prefs (`nl:settings`, `nl:usage`, `nl:active`, `nl:sidebar-hidden`).
 const diskQueue = {};   // path -> { busy, next }
 let diskDown = false;
-const bigChats = new Set();   // chats past the browser storage quota (warned once)
 function diskPut(path, body) {
   const q = diskQueue[path] || (diskQueue[path] = { busy: false, next: null });
   q.next = body;
@@ -2873,7 +2881,7 @@ async function diskDrain(path) {
       diskDown = false;
     } catch (e) {
       console.error('disk backup failed', path, e);
-      if (!diskDown) toast('disk backup failed — is the server running?');
+      if (!diskDown) toast('disk save failed — is the server running?');
       diskDown = true;
     }
   }
@@ -2882,34 +2890,52 @@ async function diskDrain(path) {
 const mirrorKey = (key, val) => diskPut('/store/key/' + key, { value: val });
 
 const saveSettings = () => { saveJSON('nl:settings', settings); mirrorKey('settings', settings); };
-const saveIndex = () => { saveJSON('nl:index', chatIndex); mirrorKey('index', chatIndex); };
+const saveIndex = () => { mirrorKey('index', chatIndex); };
 
 function loadChat(id) {
-  if (!chats[id]) chats[id] = migrateChat(loadJSON('nl:chat:' + id));
-  return chats[id];
+  return chats[id] || null;
 }
 
-// two-way sync on load, newest `updated` wins: chats missing or older on disk are
-// pushed up; chats missing or older in the browser are pulled into memory (and into
-// localStorage when they fit). chats only on disk join the sidebar.
+// On load:
+// 1) One-time migrate any legacy `nl:chat:*` / `nl:index` out of localStorage onto disk and free browser quota.
+// 2) Load the full sidebar index from disk (`/store/manifest`), pulling chat bodies on demand (or into memory).
 async function syncWithDisk() {
   let man;
   try { man = await (await fetch('/store/manifest')).json(); }
-  catch (e) { console.error('disk sync failed', e); toast('disk backup unreachable — chats are browser-only right now'); diskDown = true; return; }
+  catch (e) { console.error('disk sync failed', e); toast('disk store unreachable — is the server running?'); diskDown = true; return; }
   const disk = man.chats || {};
-  const known = new Set(chatIndex.map(c => c.id));
-  for (const c of chatIndex) {
-    const local = loadChat(c.id);
-    const d = disk[c.id];
-    if (local && (!d || (local.updated || 0) > (d.updated || 0))) diskPut('/store/chat/' + c.id, local);
-    else if (d && (!local || (d.updated || 0) > (local.updated || 0))) await pullChat(c.id);
+
+  // Migrate any legacy chats still sitting in localStorage up to disk, then delete them from localStorage
+  const legacyKeys = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith('nl:chat:')) legacyKeys.push(k);
   }
-  for (const [id, d] of Object.entries(disk)) {
-    if (known.has(id)) continue;
-    if (await pullChat(id)) chatIndex.push({ id, title: d.title, model: d.model, updated: d.updated });
+  for (const k of legacyKeys) {
+    const id = k.slice('nl:chat:'.length);
+    const local = migrateChat(loadJSON(k));
+    const d = disk[id];
+    if (local && (!d || (local.updated || 0) > (d.updated || 0))) {
+      chats[id] = local;
+      try {
+        const r = await fetch('/store/chat/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(local) });
+        if (r.ok || r.status === 409) {
+          localStorage.removeItem(k);
+          disk[id] = { updated: local.updated, title: local.title, model: local.model, created: local.created };
+        }
+      } catch (e) { console.error('migrate chat to disk failed', id, e); }
+    } else {
+      localStorage.removeItem(k);
+    }
   }
+  localStorage.removeItem('nl:index');
+
+  chatIndex = Object.entries(disk).map(([id, d]) => ({
+    id, title: d.title || 'new chat', model: d.model, updated: d.updated || 0,
+  }));
   chatIndex.sort((a, b) => (b.updated || 0) - (a.updated || 0));
   saveIndex();
+
   // settings + usage: browser copy wins when present; disk restores them when absent
   const stored = new Set(man.keys || []);
   let restored = false;
@@ -2925,14 +2951,14 @@ async function syncWithDisk() {
   if (restored) location.reload();
 }
 async function pullChat(id) {
+  if (chats[id]) return chats[id];
   try {
     const r = await fetch('/store/chat/' + id);
-    if (!r.ok) return false;
+    if (!r.ok) return null;
     const chat = migrateChat(await r.json());
     chats[id] = chat;
-    saveJSON('nl:chat:' + id, chat);
-    return true;
-  } catch (e) { console.error('pull chat', id, e); return false; }
+    return chat;
+  } catch (e) { console.error('pull chat', id, e); return null; }
 }
 
 // ── conversation tree ──
@@ -2965,10 +2991,6 @@ function saveChat(chat) {
   chat.updated = Date.now();
   const entry = chatIndex.find(c => c.id === chat.id);
   if (entry) { entry.title = chat.title; entry.model = chat.model; entry.updated = chat.updated; }
-  if (!saveJSON('nl:chat:' + chat.id, chat) && !bigChats.has(chat.id)) {
-    bigChats.add(chat.id);
-    toast('chat too big for browser storage — kept on disk');
-  }
   diskPut('/store/chat/' + chat.id, chat);
   saveIndex();
   renderSidebar();
@@ -3231,9 +3253,14 @@ function createChat() {
   return chat;
 }
 
-function switchChat(id) {
+async function switchChat(id) {
   activeChatId = id;
   saveJSON('nl:active', id);
+  if (id && !chats[id]) {
+    renderSidebar();
+    await pullChat(id);
+    if (activeChatId !== id) return;   // user clicked another chat while loading
+  }
   const chat = id ? loadChat(id) : null;
   if (chat && chat.model && hasOption(modelSelect, chat.model)) modelSelect.value = chat.model;
   updateModelBtn();
@@ -3336,8 +3363,8 @@ $('chat-list').addEventListener('dblclick', e => {
   startRename(item, item.dataset.id);
 });
 
-function startRename(item, id) {
-  const chat = loadChat(id);
+async function startRename(item, id) {
+  const chat = loadChat(id) || await pullChat(id);
   if (!chat) return;
   const titleEl = item.querySelector('.chat-title');
   const input = document.createElement('input');
@@ -4990,16 +5017,17 @@ $('usage-reset').addEventListener('click', () => {
   }
 });
 
-// ── data: backup / restore / wipe (everything lives in localStorage) ──
+// ── data: backup / restore / wipe (chats on disk; settings/prefs in localStorage) ──
 
-$('data-export').addEventListener('click', () => {
+$('data-export').addEventListener('click', async () => {
   const dump = {};
   for (let i = 0; i < localStorage.length; i++) {
     const k = localStorage.key(i);
     if (k.startsWith('nl:')) dump[k] = localStorage.getItem(k);
   }
+  dump['nl:index'] = JSON.stringify(chatIndex);
   for (const c of chatIndex) {
-    const chat = loadChat(c.id);
+    const chat = loadChat(c.id) || await pullChat(c.id);
     if (chat) dump['nl:chat:' + c.id] = JSON.stringify(chat);
   }
   download('neuralese-backup-' + new Date().toISOString().slice(0, 10) + '.json',
@@ -5012,12 +5040,20 @@ $('backup-input').addEventListener('change', e => {
   e.target.value = '';
   if (!file) return;
   const r = new FileReader();
-  r.onload = () => {
+  r.onload = async () => {
     try {
       const dump = JSON.parse(r.result);
       const keys = Object.keys(dump).filter(k => k.startsWith('nl:'));
       if (!keys.length) return toast('no neuralese data in that file');
-      keys.forEach(k => localStorage.setItem(k, dump[k]));
+      for (const k of keys) {
+        if (k.startsWith('nl:chat:')) {
+          const id = k.slice('nl:chat:'.length);
+          const chat = migrateChat(JSON.parse(dump[k]));
+          if (chat) await fetch('/store/chat/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(chat) });
+        } else if (k !== 'nl:index') {
+          localStorage.setItem(k, dump[k]);
+        }
+      }
       toast('backup restored — reloading');
       setTimeout(() => location.reload(), 600);
     } catch { toast('could not parse backup file'); }
@@ -5047,7 +5083,7 @@ $('data-wipe').addEventListener('click', () => {
 
 // ═══════════════════ init ═══════════════════
 
-chatIndex = loadJSON('nl:index') || [];
+chatIndex = [];
 applyTheme();
 // sidebar starts closed on mobile always; on desktop respect the saved preference
 if (isMobile() || localStorage.getItem('nl:sidebar-hidden') === '1') setSidebarHidden(true);
@@ -5114,16 +5150,6 @@ def agent_step():
         force_cot = opening
     else:
         force_cot = guarantee and (opening or after_tool)
-    # Partial function-call input for Gemini presets using the scratchpad method.
-    if cfg.get("method") != "channel" and force_cot and "gemini" in (cfg.get("api_model") or "").lower():
-        prefill = cfg.get("cot_prefill")
-        if prefill is None:
-            prefill = "Okay, "
-        input_msgs.append({
-            "type": "function_call", "call_id": "seed_cot",
-            "name": cfg.get("tool_name", "scratchpad"),
-            "arguments": '{"' + cfg.get("tool_param", "work") + '": "' + prefill,
-        })
     return Response(
         stream_with_context(agent_step_stream(cfg, input_msgs, model_name, enabled_tools, tool_descs, force_cot)),
         content_type='text/event-stream',
