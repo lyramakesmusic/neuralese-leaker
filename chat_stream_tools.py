@@ -1199,17 +1199,76 @@ def agent_step_stream_channel(cfg, input_msgs, model_name, enabled_tools=None, t
         return
 
 
-def split_seam_cot(raw):
-    """Split `<scratchpad>...</scratchpad>` streamed output into (cot, response)."""
+def split_seam_cot(chunks):
+    """Split `<scratchpad>...</scratchpad>` streamed output into (cot, response).
+    Accepts either a list of SSE delta chunks or a raw string. On long CoTs, Gemini
+    sometimes closes its thought with its native `<channel|>` special token instead of
+    `</scratchpad>` — upstream strips `<channel|>` at an SSE chunk boundary, leaving a
+    zero-space punctuation seam (e.g. `the doc.This is...`). Fall back to chunk-boundary
+    seam detection when `</scratchpad>` is absent."""
+    if isinstance(chunks, str):
+        chunks = [chunks]
+    raw = "".join(chunks)
     open_tag, close_tag = "<scratchpad>", "</scratchpad>"
-    s = raw.lstrip()
-    if s.startswith(open_tag):
-        body = s[len(open_tag):]
-        if close_tag in body:
-            cot, ans = body.split(close_tag, 1)
-            return cot.strip(), ans.lstrip("\r\n")
-        return body.strip(), ""
-    return "", raw
+    lead_ws = len(raw) - len(raw.lstrip())
+    s = raw[lead_ws:]
+    if not s.startswith(open_tag):
+        return "", raw
+
+    strip_len = lead_ws + len(open_tag)
+    body = raw[strip_len:]
+    if close_tag in body:
+        cot, ans = body.split(close_tag, 1)
+        return cot.strip(), ans.lstrip("\r\n")
+    if "<channel|>" in body:
+        cot, ans = body.split("<channel|>", 1)
+        return cot.strip(), ans.lstrip("\r\n")
+
+    # Shift chunks past leading whitespace + `<scratchpad>` so chunk boundaries align with `body`
+    rem = strip_len
+    shifted = []
+    for c in chunks:
+        if rem >= len(c):
+            rem -= len(c)
+        elif rem > 0:
+            shifted.append(c[rem:])
+            rem = 0
+        else:
+            shifted.append(c)
+
+    bounds = []
+    pos = 0
+    for c in shifted[:-1]:
+        pos += len(c)
+        if 0 < pos < len(body):
+            bounds.append(pos)
+
+    # Primary: chunk boundary where stripped `<channel|>` left sentence-ending
+    # punctuation glued directly to the start of the user-facing response with no space.
+    for b in reversed(bounds):
+        prev_ch = body[b - 1]
+        next_ch = body[b]
+        prev2 = body[b - 2] if b >= 2 else ""
+        if prev_ch in '.!?:"\')]*`' and not next_ch.isspace():
+            if prev_ch == "." and prev2.isdigit() and next_ch.isdigit():
+                continue  # decimal split across chunks (e.g. 3.14)
+            if prev_ch == "." and prev2.isalnum() and next_ch.islower():
+                continue  # identifier/domain split across chunks (e.g. foo.bar)
+            if re.match(r'[A-Za-z0-9$#*("\'\[\-\u0080-\uffff]', next_ch):
+                return body[:b].strip(), body[b:]
+
+    # Secondary: chunk boundary right after a meta-transition line near the tail
+    tail_floor = max(0, len(body) // 2)
+    cue_re = re.compile(r"(let'?s\s+(write|draft|respond|output|inform|answer|give|organize)|final\s+(answer|response|output)|draft\s+the\s+response)", re.I)
+    for b in reversed(bounds):
+        if b < tail_floor:
+            break
+        line_start = body.rfind("\n", 0, b - 1) + 1
+        prev_line = body[line_start:b].strip()
+        if prev_line and cue_re.search(prev_line) and body[b:b + 1] and not body[b].isspace():
+            return body[:b].strip(), body[b:]
+
+    return body.strip(), ""
 
 
 def agent_step_stream_seam(cfg, input_msgs, model_name, enabled_tools=None, tool_descs=None, max_attempts=3):
@@ -1422,7 +1481,7 @@ def agent_step_stream_seam(cfg, input_msgs, model_name, enabled_tools=None, tool
         diagnostics = {"encrypted_chars": encrypted_chars, "aside": "".join(aside_parts)}
 
         if cur_tool in TOOL_SPECS:
-            cot_text, _ = split_seam_cot("".join(raw_chunks))
+            cot_text, _ = split_seam_cot(raw_chunks)
             if cot_text or cot_started:
                 if not cot_started:
                     yield sse("step_start", {"kind": "cot", "name": "seam", "call_id": cot_call_id})
@@ -1460,7 +1519,7 @@ def agent_step_stream_seam(cfg, input_msgs, model_name, enabled_tools=None, tool
             yield sse("cot_delta", {"text": close_buf})
             close_buf = ""
 
-        cot_text, ans_text = split_seam_cot("".join(raw_chunks))
+        cot_text, ans_text = split_seam_cot(raw_chunks)
         if cot_text or cot_started:
             if not cot_started:
                 yield sse("step_start", {"kind": "cot", "name": "seam", "call_id": cot_call_id})
