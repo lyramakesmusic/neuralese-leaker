@@ -163,10 +163,9 @@ MODEL_CONFIGS = {'o3': {'api_model': 'openai/o3',
              'tool_name': 'scratchpad',
              'tool_param': 'work'},
  'gem-4-neon': {'api_model': 'google/gemini-4-neon',
-                'method': 'scratchpad',
-                'developer_msg': 'You have a scratchpad. It is for internal notes. Reason here for efficient '
-                                 'communication, call tool immediately. Maintain all reasoning in tool, avoid '
-                                 'external blocks.',
+                'method': 'seam',
+                'developer_msg': 'You have a <scratchpad> block. It is for internal notes. Maintain all reasoning '
+                                 'in <scratchpad> block, avoid external blocks.',
                 'tool_spec': {'type': 'function',
                               'name': 'scratchpad',
                               'description': 'Reason here, not visible externally.',
@@ -176,12 +175,13 @@ MODEL_CONFIGS = {'o3': {'api_model': 'openai/o3',
                                                                      'description': 'Your working notes.'}},
                                              'required': ['work'],
                                              'additionalProperties': False}},
-                'fewshot': [{'role': 'user', 'content': 'hey'},
-                            {'type': 'function_call', 'call_id': 'fs_cot_0', 'name': 'scratchpad',
-                             'arguments': '{"work":"User said hey. Reply casually."}'},
-                            {'type': 'function_call_output', 'call_id': 'fs_cot_0',
-                             'output': AGENT_SCRATCH_REPLY},
-                            {'role': 'assistant', 'content': "Hey! What's up?"}],
+                'fewshot': [{'role': 'user', 'content': 'What is 17 * 23?'},
+                            {'type': 'function_call', 'call_id': 'fs_seam_0', 'name': 'scratchpad',
+                             'arguments': '{"work":""}'},
+                            {'type': 'function_call_output', 'call_id': 'fs_seam_0',
+                             'output': ''},
+                            {'role': 'assistant',
+                             'content': '<scratchpad>\n17 * 20 = 340, 17 * 3 = 51. 340 + 51 = 391.\n</scratchpad>\n391'}],
                 'effort_step1': 'low',
                 'effort_step2': 'low',
                 'max_output_tokens': 128000,
@@ -239,7 +239,7 @@ app = Flask(__name__)
 
 OVERRIDE_KEYS = {"method", "developer_msg", "effort_step1", "effort_step2", "max_output_tokens", "tool_output_msg", "cot_prefill", "fewshot"}
 ALLOWED_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
-ALLOWED_METHODS = {"scratchpad", "channel"}
+ALLOWED_METHODS = {"scratchpad", "channel", "seam"}
 
 def effective_config(model_name, override):
     """Base config deep-copied, with whitelisted client overrides applied on top.
@@ -674,8 +674,16 @@ def build_agent_input(cfg, history, user_text, media, steps, personalize=None, t
         return {"role": "user", "content": text}
 
     is_channel = cfg.get("method") == "channel"
+    is_seam = cfg.get("method") == "seam"
     chan_prefix = cfg.get("cot_prefill") if is_channel else ""
     bare_thought = is_channel and (chan_prefix or "").startswith("thought")
+
+    def empty_seam(cid):
+        return [
+            {"type": "function_call", "call_id": cid, "name": tool_name,
+             "arguments": json.dumps({tool_param: ""})},
+            {"type": "function_call_output", "call_id": cid, "output": ""},
+        ]
 
     def wrap_chan(cot_txt, resp_txt):
         if bare_thought:
@@ -686,8 +694,10 @@ def build_agent_input(cfg, history, user_text, media, steps, personalize=None, t
             return f"<|channel>thought\n{cot_txt}\n<channel|>{resp_txt}"
         return (chan_prefix or "<|channel>thought\n<channel|>") + resp_txt
 
-    for turn in (history or []):
+    for h_idx, turn in enumerate(history or []):
         conv.append(user_item(turn.get("text"), turn.get("media") or []))
+        if is_seam:
+            conv.extend(empty_seam(f"seam_h_{h_idx}"))
         if turn.get("response"):
             resp_txt = turn["response"]
             if is_channel and not resp_txt.startswith(("<|channel>", "thought\n")):
@@ -695,9 +705,17 @@ def build_agent_input(cfg, history, user_text, media, steps, personalize=None, t
                 if prior_cot and len(prior_cot) > 1200:
                     prior_cot = prior_cot[:1200].rstrip() + "..."
                 resp_txt = wrap_chan(prior_cot, resp_txt)
+            elif is_seam and not resp_txt.startswith("<scratchpad>"):
+                prior_cot = (turn.get("cot") or "").strip()
+                if prior_cot:
+                    if len(prior_cot) > 4000:
+                        prior_cot = prior_cot[:4000].rstrip() + "..."
+                    resp_txt = f"<scratchpad>\n{prior_cot}\n</scratchpad>\n{resp_txt}"
             conv.append({"role": "assistant", "content": resp_txt})
 
     conv.append(user_item(user_text, media or []))
+    if is_seam:
+        conv.extend(empty_seam("seam_cur"))
 
     pending_chan_cot = ""
     for i, st in enumerate(steps or []):
@@ -705,6 +723,8 @@ def build_agent_input(cfg, history, user_text, media, steps, personalize=None, t
         if st.get("type") == "cot":
             if is_channel:
                 pending_chan_cot = (st.get("content") or "").strip()
+                continue
+            if is_seam:
                 continue
             conv.append({"type": "function_call", "call_id": cid, "name": tool_name,
                          "arguments": json.dumps({tool_param: st.get("content", "")})})
@@ -721,6 +741,11 @@ def build_agent_input(cfg, history, user_text, media, steps, personalize=None, t
                 conv.append({"role": "assistant", "content": wrap_chan(pending_chan_cot, "")})
                 pending_chan_cot = ""
                 conv.append({"role": "user", "content": f"[Tool result for {tname}({targs})]\n{tres}"})
+            elif is_seam:
+                conv.append({"type": "function_call", "call_id": cid, "name": tname,
+                             "arguments": targs})
+                conv.append({"type": "function_call_output", "call_id": cid,
+                             "output": tres})
             else:
                 conv.append({"type": "function_call", "call_id": cid, "name": tname,
                              "arguments": targs})
@@ -1174,6 +1199,285 @@ def agent_step_stream_channel(cfg, input_msgs, model_name, enabled_tools=None, t
         return
 
 
+def split_seam_cot(raw):
+    """Split `<scratchpad>...</scratchpad>` streamed output into (cot, response)."""
+    open_tag, close_tag = "<scratchpad>", "</scratchpad>"
+    s = raw.lstrip()
+    if s.startswith(open_tag):
+        body = s[len(open_tag):]
+        if close_tag in body:
+            cot, ans = body.split(close_tag, 1)
+            return cot.strip(), ans.lstrip("\r\n")
+        return body.strip(), ""
+    return "", raw
+
+
+def agent_step_stream_seam(cfg, input_msgs, model_name, enabled_tools=None, tool_descs=None, max_attempts=3):
+    """Gemini seam-mode streamer: ends each user turn with an empty `scratchpad(work="")`
+    tool-call/output seam so Gemini closes native thinking at token 0 (`rtok=0`) and
+    live-streams its unabridged CoT inside `<scratchpad>...</scratchpad>` in `output_text`."""
+    tool_name = cfg.get("tool_name", "scratchpad")
+    tool_param = cfg.get("tool_param", "work")
+    tool_descs = tool_descs or {}
+    tools = [cfg["tool_spec"]]
+    for n in (enabled_tools or []):
+        if n not in TOOL_SPECS:
+            continue
+        spec = copy.deepcopy(TOOL_SPECS[n])
+        if tool_descs.get(n):
+            spec["description"] = tool_descs[n]
+        tools.append(spec)
+    max_out = cfg.get("max_output_tokens", 128000)
+    provider = cfg.get("provider") or provider_for(cfg["api_model"])
+    open_tag, close_tag = "<scratchpad>", "</scratchpad>"
+
+    for attempt in range(1, max_attempts + 1):
+        tool_filter = StreamCoTFilter()
+        cur_tool = None
+        cur_call_id = ""
+        arg_chunks = []
+        raw_chunks = []
+        header_buf = ""
+        header_stripped = False
+        cot_closed = False
+        close_buf = ""
+        cot_started = False
+        cot_call_id = f"seam_{int(datetime.now().timestamp() * 1000)}"
+        usage = {}
+        retry_summary = False
+        encrypted_chars = 0
+        aside_parts = []
+        aside_break = False
+
+        def salvage_reasoning(resp_obj):
+            nonlocal encrypted_chars
+            texts, encrypted = [], 0
+            for item in (resp_obj or {}).get("output", []):
+                if item.get("type") != "reasoning":
+                    continue
+                encrypted += len(item.get("encrypted_content") or "")
+                for part in (item.get("content") or []) + (item.get("summary") or []):
+                    if part.get("text"):
+                        texts.append(part["text"].strip())
+            if texts and not aside_parts:
+                aside_parts.append("\n\n".join(texts))
+            encrypted_chars = max(encrypted_chars, encrypted)
+
+        extra = {
+            "reasoning": {"effort": cfg["effort_step1"]},
+            "max_output_tokens": max_out,
+            "tools": tools,
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        }
+        if provider:
+            extra["provider"] = provider
+
+        stream = None
+        try:
+            stream = api_stream_openrouter(cfg["api_model"], input_msgs, **extra)
+            for event in stream:
+                etype = event.get("type", "")
+                err_msg = extract_stream_error(event)
+                if err_msg:
+                    salvage_reasoning(event.get("response"))
+                    yield sse("error", {"text": err_msg, "encrypted_chars": encrypted_chars,
+                                        "aside": "".join(aside_parts)})
+                    print(f"  seam-step error: {err_msg}")
+                    return
+
+                if ("reasoning_summary" in etype or etype == "response.reasoning_text.delta") and not raw_chunks and not cur_tool:
+                    s_delta = event.get("delta") or event.get("text") or ""
+                    if s_delta.strip() and attempt < max_attempts:
+                        print(f"  [seam attempt {attempt}/{max_attempts}] summary opened — retrying")
+                        retry_summary = True
+                        break
+
+                if etype in ("response.reasoning_text.delta", "response.reasoning_summary_text.delta"):
+                    delta = event.get("delta") or ""
+                    if delta:
+                        if aside_break and aside_parts:
+                            aside_parts.append("\n\n")
+                            yield sse("aside_delta", {"text": "\n\n"})
+                        aside_break = False
+                        aside_parts.append(delta)
+                        yield sse("aside_delta", {"text": delta})
+                    continue
+                if etype == "response.reasoning_summary_part.added" or (
+                        etype == "response.output_item.added" and event.get("item", {}).get("type") == "reasoning"):
+                    aside_break = True
+
+                if etype == "response.output_item.added":
+                    item = event.get("item", {})
+                    if item.get("type") == "function_call":
+                        cur_tool = item.get("name")
+                        cur_call_id = item.get("call_id", "") or cur_call_id
+                        arg_chunks = []
+                        tool_filter = StreamCoTFilter()
+                        if cur_tool in TOOL_SPECS:
+                            yield sse("step_start", {"kind": "tool", "name": cur_tool, "call_id": cur_call_id})
+                        elif cur_tool == tool_name and not cot_started:
+                            cot_started = True
+                            yield sse("step_start", {"kind": "cot", "name": tool_name, "call_id": cur_call_id or cot_call_id})
+
+                elif etype == "response.function_call_arguments.delta":
+                    delta = event.get("delta", "")
+                    if delta and cur_tool:
+                        arg_chunks.append(delta)
+                        shown = tool_filter.feed(delta)
+                        if shown:
+                            if cur_tool == tool_name:
+                                yield sse("cot_delta", {"text": shown})
+                            else:
+                                yield sse("tool_delta", {"text": shown})
+
+                elif etype == "response.output_item.done" and event.get("item", {}).get("type") == "reasoning":
+                    encrypted_chars += len(event["item"].get("encrypted_content") or "")
+
+                elif etype == "response.function_call_arguments.done":
+                    if not cur_call_id:
+                        cur_call_id = event.get("call_id", cur_call_id)
+
+                elif etype == "response.output_text.delta":
+                    delta = event.get("delta", "")
+                    if not delta:
+                        continue
+                    raw_chunks.append(delta)
+                    if cot_closed:
+                        yield sse("response_delta", {"text": delta})
+                        continue
+                    if not header_stripped:
+                        header_buf += delta
+                        stripped = header_buf.lstrip()
+                        if len(stripped) < len(open_tag) and open_tag.startswith(stripped):
+                            continue
+                        header_stripped = True
+                        if stripped.startswith(open_tag):
+                            rest = stripped[len(open_tag):]
+                            if rest.startswith("\r\n"):
+                                rest = rest[2:]
+                            elif rest.startswith("\n"):
+                                rest = rest[1:]
+                            close_buf = rest
+                            header_buf = ""
+                        else:
+                            cot_closed = True
+                            if header_buf:
+                                yield sse("response_delta", {"text": header_buf})
+                            header_buf = ""
+                            continue
+                    else:
+                        close_buf += delta
+
+                    if close_tag in close_buf:
+                        pre, post = close_buf.split(close_tag, 1)
+                        close_buf = ""
+                        cot_closed = True
+                        if pre:
+                            if not cot_started:
+                                cot_started = True
+                                yield sse("step_start", {"kind": "cot", "name": "seam", "call_id": cot_call_id})
+                            yield sse("cot_delta", {"text": pre})
+                        post = post.lstrip("\r\n")
+                        if post:
+                            yield sse("response_delta", {"text": post})
+                    else:
+                        keep = 0
+                        for k in range(min(len(close_buf), len(close_tag) - 1), 0, -1):
+                            if close_tag.startswith(close_buf[-k:]):
+                                keep = k
+                                break
+                        emit = close_buf[:-keep] if keep else close_buf
+                        close_buf = close_buf[-keep:] if keep else ""
+                        if emit:
+                            if not cot_started:
+                                cot_started = True
+                                yield sse("step_start", {"kind": "cot", "name": "seam", "call_id": cot_call_id})
+                            yield sse("cot_delta", {"text": emit})
+
+                elif etype == "response.completed":
+                    resp_obj = event.get("response", {})
+                    usage = resp_obj.get("usage", {})
+                    salvage_reasoning(resp_obj)
+                    for it in resp_obj.get("output", []):
+                        if it.get("type") == "function_call":
+                            if not cur_tool:
+                                cur_tool = it.get("name")
+                            if not cur_call_id:
+                                cur_call_id = it.get("call_id", "")
+        except Exception as e:
+            yield sse("error", {"text": f"seam-step error: {e}", "encrypted_chars": encrypted_chars,
+                                "aside": "".join(aside_parts)})
+            print(f"  seam-step stream failed: {e}")
+            return
+        finally:
+            if stream is not None:
+                stream.close()
+
+        if retry_summary:
+            continue
+
+        cost = usage.get("cost") or 0
+        rtok = usage.get("output_tokens_details", {}).get("reasoning_tokens", 0)
+        diagnostics = {"encrypted_chars": encrypted_chars, "aside": "".join(aside_parts)}
+
+        if cur_tool in TOOL_SPECS:
+            cot_text, _ = split_seam_cot("".join(raw_chunks))
+            if cot_text or cot_started:
+                if not cot_started:
+                    yield sse("step_start", {"kind": "cot", "name": "seam", "call_id": cot_call_id})
+                yield sse("cot_done", {
+                    "content": cot_text, "call_id": cot_call_id,
+                    "cot_tokens": count_tokens(cot_text) if cot_text else 0,
+                    "reasoning_tokens": rtok, "cost": 0, **diagnostics,
+                })
+            raw_args = "".join(arg_chunks)
+            try:
+                args = json.loads(raw_args) if raw_args.strip() else {}
+            except json.JSONDecodeError:
+                args = {"code": parse_tool_arg(raw_args, "code")} if cur_tool == "run_js" else {}
+            yield sse("tool_call", {
+                "name": cur_tool, "call_id": cur_call_id, "args": args, "cost": cost, **diagnostics,
+            })
+            return
+
+        if cur_tool == tool_name and not raw_chunks:
+            # Defensive fallback if model called the scratchpad tool directly
+            cot_text = parse_tool_arg("".join(arg_chunks), tool_param)
+            if not cot_started:
+                yield sse("step_start", {"kind": "cot", "name": tool_name, "call_id": cur_call_id or cot_call_id})
+            yield sse("cot_done", {
+                "content": cot_text, "call_id": cur_call_id or cot_call_id,
+                "cot_tokens": count_tokens(cot_text) if cot_text else 0,
+                "reasoning_tokens": rtok, "cost": cost, **diagnostics,
+            })
+            return
+
+        if close_buf and not cot_closed:
+            if not cot_started:
+                cot_started = True
+                yield sse("step_start", {"kind": "cot", "name": "seam", "call_id": cot_call_id})
+            yield sse("cot_delta", {"text": close_buf})
+            close_buf = ""
+
+        cot_text, ans_text = split_seam_cot("".join(raw_chunks))
+        if cot_text or cot_started:
+            if not cot_started:
+                yield sse("step_start", {"kind": "cot", "name": "seam", "call_id": cot_call_id})
+            yield sse("cot_done", {
+                "content": cot_text, "call_id": cot_call_id,
+                "cot_tokens": count_tokens(cot_text) if cot_text else 0,
+                "reasoning_tokens": rtok, "cost": 0, **diagnostics,
+            })
+
+        yield sse("final", {
+            "response": ans_text, "usage": usage,
+            "response_tokens": count_tokens(ans_text) if ans_text else 0,
+            "reasoning_tokens": rtok, "cost": cost, **diagnostics,
+        })
+        return
+
+
 def agent_step_stream(cfg, input_msgs, model_name, enabled_tools=None, tool_descs=None, force_cot=False):
     """Stream ONE model call in the agentic loop. The model either (a) calls the
     scratchpad (thinking), (b) calls run_js, or (c) writes the final answer. We
@@ -1186,6 +1490,9 @@ def agent_step_stream(cfg, input_msgs, model_name, enabled_tools=None, tool_desc
     opening CoT and let it interleave freely (auto) after that."""
     if cfg.get("method") == "channel":
         yield from agent_step_stream_channel(cfg, input_msgs, model_name, enabled_tools, tool_descs)
+        return
+    if cfg.get("method") == "seam":
+        yield from agent_step_stream_seam(cfg, input_msgs, model_name, enabled_tools, tool_descs)
         return
     tool_name = cfg.get("tool_name", "scratchpad")
     tool_param = cfg.get("tool_param", "work")
@@ -2551,6 +2858,7 @@ HTML = r"""<!DOCTYPE html>
               <select>
                 <option value="scratchpad">scratchpad (tool)</option>
                 <option value="channel">channel (gemini)</option>
+                <option value="seam">seam (gemini live stream)</option>
               </select>
             </div>
           </div>
